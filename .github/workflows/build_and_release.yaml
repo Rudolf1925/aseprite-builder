@@ -61,6 +61,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
+            clang libc++-dev libc++abi-dev \
+            libssl-dev \
             libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
             libfontconfig1-dev
@@ -101,30 +103,49 @@ jobs:
             export skia_arch=x64
           fi
 
+          EXTRA_ARGS=()
+          if [[ "${{ runner.os }}" == "Linux" ]] ; then
+            # Aseprite's prebuilt Skia for Linux is built against libc++
+            export CC=clang
+            export CXX=clang++
+            EXTRA_ARGS+=(
+              -DCMAKE_CXX_FLAGS=-stdlib=libc++
+              -DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++
+            )
+          fi
+
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
             -DENABLE_TESTS=OFF \
             -DENABLE_SCRIPTING=$enable_scripting \
             -DENABLE_CCACHE=$enable_ccache \
             -DLAF_BACKEND=$laf_backend \
             -DSKIA_DIR=$(realpath skia) \
-            -DOPENSSL_USE_STATIC_LIBS=ON \
-            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch) \
+            "${EXTRA_ARGS[@]}"
       - name: Compiling
         shell: bash
         working-directory: aseprite
         run: |
-          cd build && ninja
+          cd build && ninja aseprite
+      - name: Verify build output
+        shell: bash
+        working-directory: aseprite/build/bin
+        run: |
+          ls -la
+          test -d data || { echo "data folder missing"; exit 1; }
       - name: Clean Up Build folder
         working-directory: aseprite/build/bin
         shell: bash
         run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
       - name: Make portable zip
         working-directory: aseprite/build/bin
+        shell: bash
         run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
       - name: Create release
         working-directory: aseprite/build/bin
+        shell: bash
         run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
       - name: Upload release
         uses: svenstaro/upload-release-action@v2
