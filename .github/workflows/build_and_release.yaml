@@ -1,48 +1,53 @@
-name: Build and release Aseprite 
+name: Build and release Aseprite
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'BuildLog.md'
+      - BuildLog.md
   workflow_dispatch:
+
 env:
   BUILD_TYPE: Release
 
 jobs:
   fetch-aseprite-info:
-    name: Fetch deps info
+    name: Fetch latest Aseprite release
     runs-on: ubuntu-latest
     outputs:
-      download-link: ${{ steps.aseprite-link.outputs.download-link }}
-      release-tag: ${{ steps.aseprite-link.outputs.release-tag }}
+      release-tag: ${{ steps.aseprite-info.outputs.release-tag }}
     steps:
-      - name: Fetch Aseprite release link
-        id: aseprite-link
-        uses: a1393323447/fetch-release@main
-        with:
-            group: aseprite
-            repo: aseprite
-            match: Aseprite-.*?-Source.zip
+      - name: Get latest Aseprite source release
+        id: aseprite-info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/aseprite/aseprite/releases \
+            --jq 'map(select(.prerelease == false)) | .[0].tag_name')
+          test -n "$tag"
+          echo "release-tag=$tag" >> "$GITHUB_OUTPUT"
 
   create-release:
-    name: Create Release
+    name: Create GitHub release
     runs-on: ubuntu-latest
     needs: fetch-aseprite-info
     permissions:
       contents: write
     outputs:
-      download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
       release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: ncipollo/release-action@v1.21.0
-        with:
-          tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          skipIfReleaseExists: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag='${{ needs.fetch-aseprite-info.outputs.release-tag }}'
+          gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1 ||
+            gh release create "$tag" \
+              --repo '${{ github.repository }}' \
+              --title "Aseprite $tag" \
+              --notes "Aseprite $tag"
 
   build-aseprite:
     name: Build Aseprite
@@ -51,106 +56,120 @@ jobs:
       contents: write
     runs-on: ${{ matrix.os }}
     strategy:
-        matrix:
-          os: [ windows-latest, ubuntu-latest ]
-        fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+      fail-fast: false
     steps:
-      - name: Install Dependencies
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        shell: bash
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            clang libc++-dev libc++abi-dev \
-            libssl-dev \
+            build-essential cmake ninja-build clang lld \
+            libc++-dev libc++abi-dev libssl-dev libjpeg-dev libpng-dev \
             libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
-            libfontconfig1-dev
-      - uses: actions/checkout@v7
-      - name: Install Aseprite
-        shell: bash
+            libarchive-dev libarchive-tools libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev \
+            libgtk-3-dev libzstd-dev libbsd-dev liblzma-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Clone Aseprite
         run: |
-          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch '${{ needs.create-release.outputs.release-tag }}' \
+            https://github.com/aseprite/aseprite aseprite
+
       - name: Install Skia
         working-directory: aseprite
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]] ; then
-            choco install wget -y --no-progress
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
-            unzip Skia-Windows-Release-x64.zip -d skia
-          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
-            unzip Skia-macOS-Release-arm64.zip -d skia
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            curl -L --fail --retry 3 \
+              -o Skia.zip \
+              https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
+            7z x Skia.zip -oskia
           else
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
-            unzip Skia-Linux-Release-x64.zip -d skia
+            curl -L --fail --retry 3 \
+              -o Skia.zip \
+              https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
+            unzip -q Skia.zip -d skia
           fi
+
       - uses: aseprite/get-ninja@main
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
+
+      - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
-      - name: Generating Makefiles
+
+      - name: Generate Makefiles
         shell: bash
         working-directory: aseprite
         run: |
-          export enable_ccache=off
-          export laf_backend=skia
-          export enable_scripting=on
-
-          if [[ "${{ runner.os }}" == "macOS" ]] ; then
-            export skia_arch=arm64
-          else
-            export skia_arch=x64
-          fi
-
+          set -euo pipefail
           EXTRA_ARGS=()
-          if [[ "${{ runner.os }}" == "Linux" ]] ; then
-            # Aseprite's prebuilt Skia for Linux is built against libc++
+
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
             export CC=clang
             export CXX=clang++
             EXTRA_ARGS+=(
-              -DCMAKE_CXX_FLAGS=-stdlib=libc++
-              -DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++
+              -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
+              -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
+              -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld"
             )
           fi
 
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
+            -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" \
             -DENABLE_TESTS=OFF \
-            -DENABLE_SCRIPTING=$enable_scripting \
-            -DENABLE_CCACHE=$enable_ccache \
-            -DLAF_BACKEND=$laf_backend \
-            -DSKIA_DIR=$(realpath skia) \
-            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch) \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=OFF \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$(pwd)/skia" \
+            -DSKIA_LIBRARY_DIR="$(pwd)/skia/out/Release-x64" \
             "${EXTRA_ARGS[@]}"
-      - name: Compiling
+
+      - name: Compile
         shell: bash
         working-directory: aseprite
-        run: |
-          cd build && ninja aseprite
+        run: cmake --build build --target aseprite --parallel 2
+
       - name: Verify build output
         shell: bash
+        run: |
+          set -e
+          cd aseprite/build/bin
+          ls -la
+          test -d data
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            test -f aseprite.exe
+          else
+            test -f aseprite
+          fi
+
+      - name: Prepare portable build
+        shell: bash
         working-directory: aseprite/build/bin
         run: |
-          ls -la
-          test -d data || { echo "data folder missing"; exit 1; }
-      - name: Clean Up Build folder
-        working-directory: aseprite/build/bin
+          set -e
+          printf '# Portable Aseprite build\n' > aseprite.ini
+          rm -rf .git CMakeFiles
+
+      - name: Create archive
         shell: bash
-        run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
-      - name: Make portable zip
         working-directory: aseprite/build/bin
+        run: |
+          set -e
+          platform=Linux
+          [[ "${{ runner.os }}" == "Windows" ]] && platform=Windows
+          7z a -tzip "Aseprite-${{ needs.create-release.outputs.release-tag }}-${platform}.zip" *
+          echo "platform=$platform" >> "$GITHUB_ENV"
+
+      - name: Upload archive
         shell: bash
-        run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
-      - name: Create release
-        working-directory: aseprite/build/bin
-        shell: bash
-        run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
-      - name: Upload release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
-          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
-          tag: ${{ needs.create-release.outputs.release-tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag='${{ needs.create-release.outputs.release-tag }}'
+          gh release upload "$tag" \
+            "aseprite/build/bin/Aseprite-${tag}-${platform}.zip" \
+            --repo '${{ github.repository }}' --clobber
